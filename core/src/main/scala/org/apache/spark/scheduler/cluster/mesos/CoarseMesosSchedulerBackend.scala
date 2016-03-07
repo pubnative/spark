@@ -97,6 +97,9 @@ private[spark] class CoarseMesosSchedulerBackend(
 
   val extraCoresPerSlave = conf.getInt("spark.mesos.extra.cores", 0)
 
+  val coresPerExecutor = conf.getOption("spark.mesos.executor.cores").map(_.toInt)
+  val mesosCoresPerExecutor = conf.getOption("spark.mesos.executor.cores_per_task").map(_.toDouble)
+
   // Offer constraints
   private val slaveOfferConstraints =
     parseConstraintString(sc.conf.get("spark.mesos.constraints", ""))
@@ -251,17 +254,18 @@ private[spark] class CoarseMesosSchedulerBackend(
         val meetsConstraints = matchesAttributeRequirements(slaveOfferConstraints, offerAttributes)
         val slaveId = offer.getSlaveId.getValue
         val mem = getResource(offer.getResourcesList, "mem")
-        val cpus = getResource(offer.getResourcesList, "cpus").toInt
+        val mesosCpus = getResource(offer.getResourcesList, "cpus")
+        val cpus = mesosCpus.toInt
         val id = offer.getId.getValue
         if (meetsConstraints) {
           if (taskIdToSlaveId.size < executorLimit &&
               totalCoresAcquired < maxCores &&
               mem >= calculateTotalMemory(sc) &&
-              cpus >= 1 &&
+              cpus >= mesosCoresPerExecutor.getOrElse(1.0) &&
               failuresBySlaveId.getOrElse(slaveId, 0) < MAX_SLAVE_FAILURES &&
               !slaveIdsWithExecutors.contains(slaveId)) {
             // Launch an executor on the slave
-            val cpusToUse = math.min(cpus, maxCores - totalCoresAcquired)
+            val cpusToUse = coresPerExecutor.getOrElse(math.min(cpus, maxCores - totalCoresAcquired))
             totalCoresAcquired += cpusToUse
             val taskId = newMesosTaskId()
             taskIdToSlaveId.put(taskId, slaveId)
@@ -269,9 +273,12 @@ private[spark] class CoarseMesosSchedulerBackend(
             coresByTaskId(taskId) = cpusToUse
             // Gather cpu resources from the available resources and use them in the task.
             val (remainingResources, cpuResourcesToUse) =
-              partitionResources(offer.getResourcesList, "cpus", cpusToUse)
+              partitionResources(offer.getResourcesList, "cpus", mesosCoresPerExecutor.getOrElse(cpusToUse))
             val (_, memResourcesToUse) =
               partitionResources(remainingResources.asJava, "mem", calculateTotalMemory(sc))
+
+            logInfo(s"resources to use: ${cpuResourcesToUse} , ${memResourcesToUse}")
+            logInfo(s"command ${createCommand(offer, cpusToUse + extraCoresPerSlave, taskId)}")
             val taskBuilder = MesosTaskInfo.newBuilder()
               .setTaskId(TaskID.newBuilder().setValue(taskId.toString).build())
               .setSlaveId(offer.getSlaveId)
@@ -286,20 +293,20 @@ private[spark] class CoarseMesosSchedulerBackend(
             }
 
             // Accept the offer and launch the task
-            logDebug(s"Accepting offer: $id with attributes: $offerAttributes mem: $mem cpu: $cpus")
+            logInfo(s"Accepting offer: $id with attributes: $offerAttributes mem: $mem cpu: $cpus")
             slaveIdToHost(offer.getSlaveId.getValue) = offer.getHostname
             d.launchTasks(
               Collections.singleton(offer.getId),
               Collections.singleton(taskBuilder.build()), filters)
           } else {
             // Decline the offer
-            logDebug(s"Declining offer: $id with attributes: $offerAttributes mem: $mem cpu: $cpus")
+            logInfo(s"Declining offer: $id with attributes: $offerAttributes mem: $mem cpu: $cpus")
             d.declineOffer(offer.getId)
           }
         } else {
           // This offer does not meet constraints. We don't need to see it again.
           // Decline the offer for a long period of time.
-          logDebug(s"Declining offer: $id with attributes: $offerAttributes mem: $mem cpu: $cpus"
+          logInfo(s"Declining offer: $id with attributes: $offerAttributes mem: $mem cpu: $cpus"
               + s" for $rejectOfferDurationForUnmetConstraints seconds")
           d.declineOffer(offer.getId, Filters.newBuilder()
             .setRefuseSeconds(rejectOfferDurationForUnmetConstraints).build())
