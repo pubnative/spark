@@ -433,6 +433,12 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
         driver.launchTasks(
           Collections.singleton(offer.getId),
           offerTasks.asJava)
+      } else if (executorLimitOption.map(numExecutors() >= _).getOrElse(false)) {
+        // Reject an offer for a configurable amount of time to avoid starving other frameworks
+        declineOffer(driver,
+          offer,
+          Some("reached executors limit"),
+          Some(rejectOfferDurationForReachedMaxCores))
       } else if (totalCoresAcquired >= maxCores) {
         // Reject an offer for a configurable amount of time to avoid starving other frameworks
         declineOffer(driver,
@@ -570,9 +576,9 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
 
     cpus > 0 &&
       cpus <= offerCPUs &&
-      cpus + totalCoresAcquired <= maxCores &&
+      executorLimitOption.map(numExecutors() < _).
+        getOrElse(cpus + totalCoresAcquired <= maxCores) &&
       mem <= offerMem &&
-      numExecutors < executorLimit &&
       slaves.get(slaveId).map(_.taskFailures).getOrElse(0) < MAX_SLAVE_FAILURES &&
       meetsPortRequirements &&
       satisfiesLocality(offerHostname)
